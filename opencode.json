@@ -1,0 +1,37 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "local-server": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local Assistant",
+      "options": {
+        "baseURL": "http://localhost:8317/v1",
+        "apiKey": "none-of-your-business"
+      },
+      "models": {
+        "gpt-5": { "name": "gpt-5" },
+        "gpt-5-codex": { "name": "gpt-5-codex" },
+        "gpt-5-codex-mini": { "name": "gpt-5-codex-mini" },
+        "gpt-5.1": { "name": "gpt-5.1" },
+        "gpt-5.1-codex": { "name": "gpt-5.1-codex" },
+        "gpt-5.2": { "name": "gpt-5.2" },
+        "gpt-5.2-codex": { "name": "gpt-5.2-codex" },
+        "gpt-5.1-codex-mini": { "name": "gpt-5.1-codex-mini" },
+        "gpt-5.1-codex-max": { "name": "gpt-5.1-codex-max" },
+        "gpt-5.3-codex": { "name": "gpt-5.3-codex" },
+        "gpt-5.3-codex-spark": { "name": "gpt-5.3-codex-spark" }
+      }
+    }
+  },
+  "model": "local-server/gpt-5.2",
+  "mcp": {
+    "playwright": {
+      "type": "local",
+      "command": [
+        "npx",
+        "@playwright/mcp@latest"
+      ],
+      "enabled": true
+    }
+  }
+}

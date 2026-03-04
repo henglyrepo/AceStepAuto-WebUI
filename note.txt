@@ -1,0 +1,59 @@
+How to use main.py (AceStepAuto)
+
+Overview
+- main.py generates a "song package" (title + caption + structured lyrics) using a local OpenAI-compatible LLM server.
+- Then it calls the ACE-Step 1.5 REST API to render audio.
+- It downloads the audio and writes a JSON sidecar with metadata.
+
+Prereqs (one-time)
+1) Install ACE-Step dependencies
+   - Open a terminal in `ACE-Step-1.5/`
+   - Run: `uv sync`
+
+2) Start the ACE-Step REST API
+   Option A (easy): run `ACE-Step-1.5\start_api_server.bat`
+   Option B: `uv run acestep-api --host 127.0.0.1 --port 8001`
+
+3) Verify ACE-Step is up
+   - http://127.0.0.1:8001/health
+   - http://127.0.0.1:8001/docs
+
+LLM server config
+- Default LLM base URL: `http://localhost:8317/v1`
+- Default model: `gpt-5.2`
+
+If your LLM server requires auth (common), set one of:
+- `LLM_API_KEY` (preferred)
+- `OPENAI_API_KEY` (fallback)
+
+You can also pass it directly:
+- `--llm-api-key "..."`
+
+Basic usage
+`python main.py --topic "first love" --style "k-pop dance pop" --lang en --duration 30 --audio-format mp3 --batch-size 1`
+
+WebUI (Gradio)
+- Run (recommended using ACE-Step embedded Python):
+  - `ACE-Step-1.5\python_embeded\python.exe webui.py`
+- Or double-click:
+  - `start_webui.bat`
+- Open the local URL printed in the terminal.
+- Preferred port is 7865. If busy, it auto-picks the next free port.
+- Override preferred port with env var: `WEBUI_PORT=7865`
+- `start_webui.bat` auto-checks ACE-Step on port 8001 and starts it if missing.
+- Features:
+  - Start/Stop song generation (runs `main.py`)
+  - Start/Stop ACE-Step server (runs `ACE-Step-1.5\start_api_server.bat`)
+  - History picker for recent runs in `output/`
+
+Useful flags
+- `--duration 30` (shorter = less VRAM/time)
+- `--batch-size 1` (recommended for 8GB VRAM)
+- `--inference-steps 8` (speed/quality tradeoff)
+- `--no-thinking` (often faster)
+- `--skip-format` (skip ACE-Step /format_input if it errors)
+
+Outputs
+- Folder: `output/<timestamp>_<title>/`
+- Audio: `output/<timestamp>_<title>/audio.<mp3|wav|flac>`
+- Sidecar JSON: `output/<timestamp>_<title>/meta.json`
