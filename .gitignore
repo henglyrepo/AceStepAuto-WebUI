@@ -3,6 +3,11 @@
 
 output/
 
+# Local tools (committed binaries not recommended)
+tools/ffmpeg.exe
+tools/ffprobe.exe
+tools/ffplay.exe
+
 # Vendored engine (large). Keep locally but don't commit.
 ACE-Step-1.5/
 

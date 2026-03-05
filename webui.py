@@ -1,6 +1,8 @@
 import json
 import os
 import queue
+import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -8,6 +10,8 @@ import time
 import webbrowser
 import urllib.error
 import urllib.request
+import urllib.parse
+
 
 import gradio as gr
 
@@ -189,7 +193,13 @@ def _http_post_json(
     return json.loads(raw)
 
 
-def _check_endpoints(*, llm_base: str, llm_api_key: str, acestep_api: str) -> str:
+def _check_endpoints(
+    *,
+    llm_base: str,
+    llm_api_key: str,
+    acestep_api: str,
+    comfy_url: str,
+) -> str:
     lines: list[str] = []
 
     # ACE-Step health
@@ -199,6 +209,18 @@ def _check_endpoints(*, llm_base: str, llm_api_key: str, acestep_api: str) -> st
         lines.append(f"ACE-Step: OK ({status})")
     except Exception as e:
         lines.append(f"ACE-Step: NOT OK ({e})")
+
+    # ComfyUI health (best-effort)
+    comfy = (comfy_url or "http://127.0.0.1:8188").strip() or "http://127.0.0.1:8188"
+    try:
+        _http_get_json(comfy.rstrip("/") + "/system_stats", timeout=3.0)
+        lines.append("ComfyUI: OK (/system_stats)")
+    except Exception:
+        host, port = _parse_http_host_port(comfy, 8188)
+        if _tcp_is_open(host, port, timeout_s=0.5):
+            lines.append("ComfyUI: REACHABLE")
+        else:
+            lines.append("ComfyUI: NOT OK")
 
     # LLM models
     try:
@@ -225,6 +247,7 @@ def _check_endpoints(*, llm_base: str, llm_api_key: str, acestep_api: str) -> st
 
 def _extract_json_object(text: str) -> dict:
     text = (text or "").strip()
+    # Try direct parse first.
     try:
         obj = json.loads(text)
         if isinstance(obj, dict):
@@ -232,15 +255,20 @@ def _extract_json_object(text: str) -> dict:
     except Exception:
         pass
 
-    import re
+    # Fall back to extracting the first JSON object from mixed text.
+    # This handles common cases like code fences or preambles.
+    dec = json.JSONDecoder()
+    i = text.find("{")
+    while i != -1:
+        try:
+            obj, _end = dec.raw_decode(text[i:])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        i = text.find("{", i + 1)
 
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not m:
-        raise ValueError("LLM did not return JSON")
-    obj = json.loads(m.group(0))
-    if not isinstance(obj, dict):
-        raise ValueError("LLM JSON root is not an object")
-    return obj
+    raise ValueError("LLM did not return a JSON object")
 
 
 def _llm_key_from_inputs(llm_api_key: str) -> str:
@@ -255,25 +283,24 @@ def _llm_key_from_inputs(llm_api_key: str) -> str:
 def llm_suggest_topic(
     style: str, genres: list[str], llm_base: str, llm_model: str, llm_api_key: str
 ) -> tuple[str, str]:
-    key = _llm_key_from_inputs(llm_api_key)
-    if not key:
-        return "", "Missing LLM API key (set LLM_API_KEY in .env or paste it and Save)."
-
     genre_mix = ", ".join(genres or [])
     prompt = (
-        "Return ONLY JSON with keys: topic. "
+        "Return ONLY JSON with keys: topic. Do not wrap in markdown or code fences. "
         "Topic must be short (2-8 words), modern, and ASCII.\n"
         f"Style: {style.strip()}\n"
         f"Genres: {genre_mix}\n"
     )
     url = llm_base.rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {key}"}
+    headers: dict[str, str] = {}
+    key = _llm_key_from_inputs(llm_api_key)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     payload = {
         "model": llm_model,
         "messages": [
             {
                 "role": "system",
-                "content": "You generate music prompts. Return only JSON.",
+                "content": "You generate music prompts. Return only JSON. No code fences.",
             },
             {"role": "user", "content": prompt},
         ],
@@ -294,25 +321,24 @@ def llm_suggest_topic(
 def llm_suggest_style(
     topic: str, genres: list[str], llm_base: str, llm_model: str, llm_api_key: str
 ) -> tuple[str, str]:
-    key = _llm_key_from_inputs(llm_api_key)
-    if not key:
-        return "", "Missing LLM API key (set LLM_API_KEY in .env or paste it and Save)."
-
     genre_mix = ", ".join(genres or [])
     prompt = (
-        "Return ONLY JSON with keys: style. "
+        "Return ONLY JSON with keys: style. Do not wrap in markdown or code fences. "
         "Style must be a single short line (genre + production vibe + instruments + vocal vibe). ASCII only.\n"
         f"Topic: {topic.strip()}\n"
         f"Genres: {genre_mix}\n"
     )
     url = llm_base.rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {key}"}
+    headers: dict[str, str] = {}
+    key = _llm_key_from_inputs(llm_api_key)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     payload = {
         "model": llm_model,
         "messages": [
             {
                 "role": "system",
-                "content": "You generate music prompts. Return only JSON.",
+                "content": "You generate music prompts. Return only JSON. No code fences.",
             },
             {"role": "user", "content": prompt},
         ],
@@ -330,6 +356,128 @@ def llm_suggest_style(
         return "", f"LLM error: {e}"
 
 
+def _normalize_genre_name(s: str) -> str:
+    import re
+
+    s = (s or "").strip().lower()
+    # Keep only alphanumerics for tolerant matching.
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def _coerce_genres(raw, allowed: list[str]) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        # Support comma-separated strings.
+        raw_list = [x.strip() for x in raw.split(",") if x.strip()]
+    elif isinstance(raw, list):
+        raw_list = [str(x).strip() for x in raw if str(x).strip()]
+    else:
+        raw_list = [str(raw).strip()] if str(raw).strip() else []
+
+    canon = {_normalize_genre_name(g): g for g in (allowed or [])}
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_list:
+        key = _normalize_genre_name(item)
+        g = canon.get(key)
+        if not g:
+            continue
+        if g in seen:
+            continue
+        out.append(g)
+        seen.add(g)
+    return out
+
+
+def llm_suggest_style_with_genres(
+    topic: str,
+    llm_base: str,
+    llm_model: str,
+    llm_api_key: str,
+    allowed_genres: list[str],
+) -> tuple[str, list[str], str]:
+    """Suggest style and (optional) relevant genres.
+
+    Used by the WebUI when the user has not selected any genres.
+    """
+
+    genre_allowed = ", ".join(allowed_genres or [])
+    prompt = (
+        "Return ONLY JSON with keys: style, genres. Do not wrap in markdown or code fences.\n"
+        "Rules:\n"
+        "- style: one line (genre + production vibe + instruments + vocal vibe), ASCII only\n"
+        "- genres: 1-3 items, must be picked from the Allowed genres list exactly\n"
+        f"Topic: {topic.strip()}\n"
+        f"Allowed genres: {genre_allowed}\n"
+    )
+
+    url = llm_base.rstrip("/") + "/chat/completions"
+    headers: dict[str, str] = {}
+    key = _llm_key_from_inputs(llm_api_key)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    payload = {
+        "model": llm_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You generate music prompts. Return only JSON. No code fences.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.9,
+    }
+
+    try:
+        resp = _http_post_json(url, payload, timeout=30.0, headers=headers)
+        content = resp["choices"][0]["message"]["content"]
+        obj = _extract_json_object(content)
+        style = (obj.get("style") or "").strip()
+        if not style:
+            return "", [], "LLM returned empty style."
+        genres = _coerce_genres(obj.get("genres"), allowed_genres)
+        genres, _ = _enforce_max_genres(genres)
+        return style, genres, "OK"
+    except Exception as e:
+        return "", [], f"LLM error: {e}"
+
+
+def suggest_style_click(
+    topic: str,
+    genres: list[str] | None,
+    llm_base: str,
+    llm_model: str,
+    llm_api_key: str,
+) -> tuple[str, list[str], str]:
+    """UI handler for 'Suggest Style From Topic'.
+
+    If the user hasn't selected any genres yet, also suggest 1-3 relevant genres
+    from the allowed list and auto-select them.
+    """
+
+    g = genres or []
+    if not g:
+        style_out, genres_out, status = llm_suggest_style_with_genres(
+            topic=topic,
+            llm_base=llm_base,
+            llm_model=llm_model,
+            llm_api_key=llm_api_key,
+            allowed_genres=GENRES_TOP20,
+        )
+        return style_out, genres_out, status
+
+    style_out, status = llm_suggest_style(
+        topic=topic,
+        genres=g,
+        llm_base=llm_base,
+        llm_model=llm_model,
+        llm_api_key=llm_api_key,
+    )
+    return style_out, g, status
+
+
 def llm_suggest_both(
     topic: str,
     style: str,
@@ -338,17 +486,9 @@ def llm_suggest_both(
     llm_model: str,
     llm_api_key: str,
 ) -> tuple[str, str, str]:
-    key = _llm_key_from_inputs(llm_api_key)
-    if not key:
-        return (
-            topic,
-            style,
-            "Missing LLM API key (set LLM_API_KEY in .env or paste it and Save).",
-        )
-
     genre_mix = ", ".join(genres or [])
     prompt = (
-        "Return ONLY JSON with keys: topic, style. ASCII only.\n"
+        "Return ONLY JSON with keys: topic, style. ASCII only. Do not wrap in markdown or code fences.\n"
         "Rules:\n"
         "- topic: short (2-8 words)\n"
         "- style: one line (genre + production + instruments + vocal vibe)\n"
@@ -357,13 +497,16 @@ def llm_suggest_both(
         f"Genres: {genre_mix}\n"
     )
     url = llm_base.rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {key}"}
+    headers: dict[str, str] = {}
+    key = _llm_key_from_inputs(llm_api_key)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     payload = {
         "model": llm_model,
         "messages": [
             {
                 "role": "system",
-                "content": "You generate music prompts. Return only JSON.",
+                "content": "You generate music prompts. Return only JSON. No code fences.",
             },
             {"role": "user", "content": prompt},
         ],
@@ -380,12 +523,283 @@ def llm_suggest_both(
         return topic, style, f"LLM error: {e}"
 
 
+def llm_random_topic_style(
+    genres: list[str] | None,
+    llm_base: str,
+    llm_model: str,
+    llm_api_key: str,
+    allowed_genres: list[str],
+) -> tuple[str, str, list[str], str]:
+    """Generate a random topic + style.
+
+    - If genres are selected, do not change them; style should match.
+    - If no genres selected, also suggest 1-3 genres from allowed list.
+    """
+
+    g_in = [x for x in (genres or []) if (x or "").strip()]
+    genre_mix = ", ".join(g_in)
+    allowed_mix = ", ".join(allowed_genres or [])
+
+    if genre_mix:
+        prompt = (
+            "Return ONLY JSON with keys: topic, style. ASCII only. Do not wrap in markdown or code fences.\n"
+            "Rules:\n"
+            "- topic: short (2-8 words), modern, catchy\n"
+            "- style: one line (genre + production vibe + instruments + vocal vibe)\n"
+            "- Make the style strongly match the selected genres\n"
+            "- Keep it feasible for a 30-60s generated song\n"
+            f"Selected genres: {genre_mix}\n"
+        )
+    else:
+        prompt = (
+            "Return ONLY JSON with keys: topic, style, genres. ASCII only. Do not wrap in markdown or code fences.\n"
+            "Rules:\n"
+            "- topic: short (2-8 words), modern, catchy\n"
+            "- style: one line (genre + production vibe + instruments + vocal vibe)\n"
+            "- genres: 1-3 items, must be picked from the Allowed genres list exactly\n"
+            "- Keep it feasible for a 30-60s generated song\n"
+            f"Allowed genres: {allowed_mix}\n"
+        )
+
+    url = llm_base.rstrip("/") + "/chat/completions"
+    headers: dict[str, str] = {}
+    key = _llm_key_from_inputs(llm_api_key)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    payload = {
+        "model": llm_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You generate music prompt ideas. Return only JSON. No code fences.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 1.0,
+    }
+
+    try:
+        resp = _http_post_json(url, payload, timeout=30.0, headers=headers)
+        content = resp["choices"][0]["message"]["content"]
+        obj = _extract_json_object(content)
+        out_topic = (obj.get("topic") or "").strip()
+        out_style = (obj.get("style") or "").strip()
+        if not out_topic or not out_style:
+            return "", "", (g_in or []), "LLM returned empty topic/style."
+
+        if g_in:
+            g_out, _ = _enforce_max_genres(g_in)
+            return out_topic, out_style, g_out, "OK"
+
+        # No genres selected: try to coerce from allowed list.
+        g_out = _coerce_genres(obj.get("genres"), allowed_genres)
+        g_out, _ = _enforce_max_genres(g_out)
+        if not g_out:
+            # Leave blank if LLM didn't comply.
+            return out_topic, out_style, [], "OK (no genres suggested)"
+        return out_topic, out_style, g_out, "OK"
+    except Exception as e:
+        return "", "", (g_in or []), f"LLM error: {e}"
+
+
+def random_idea_click(
+    genres: list[str] | None,
+    llm_base: str,
+    llm_model: str,
+    llm_api_key: str,
+) -> tuple[str, str, list[str], str]:
+    return llm_random_topic_style(
+        genres=genres,
+        llm_base=llm_base,
+        llm_model=llm_model,
+        llm_api_key=llm_api_key,
+        allowed_genres=GENRES_TOP20,
+    )
+
+
 def _enforce_max_genres(genres: list[str]) -> tuple[list[str], str]:
     g = list(genres or [])
     if len(g) <= 5:
         return g, ""
     trimmed = g[:5]
     return trimmed, "Max 5 genres. Trimmed selection to first 5."
+
+
+def _bg_preset_updates(preset: str):
+    """Return gr.update() objects for background grading sliders."""
+
+    p = (preset or "").strip().lower()
+    if p in ("", "custom"):
+        return (
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
+
+    presets = {
+        # Soft, filmic, readable.
+        "cinematic soft": {
+            "blur": 2.8,
+            "grain": 10.0,
+            "vignette": 0.60,
+            "brightness": -0.04,
+            "saturation": 1.08,
+            "contrast": 1.06,
+            "plate": 0.30,
+        },
+        # Minimal processing.
+        "crisp": {
+            "blur": 1.4,
+            "grain": 6.0,
+            "vignette": 0.40,
+            "brightness": -0.02,
+            "saturation": 1.04,
+            "contrast": 1.02,
+            "plate": 0.26,
+        },
+        # Darker, heavier plate for club/EDM.
+        "dark club": {
+            "blur": 3.2,
+            "grain": 12.0,
+            "vignette": 0.70,
+            "brightness": -0.07,
+            "saturation": 1.10,
+            "contrast": 1.10,
+            "plate": 0.36,
+        },
+        # Warmer, slightly lifted mids.
+        "warm film": {
+            "blur": 2.6,
+            "grain": 9.0,
+            "vignette": 0.55,
+            "brightness": -0.03,
+            "saturation": 1.12,
+            "contrast": 1.04,
+            "plate": 0.28,
+        },
+    }
+
+    cfg = presets.get(p)
+    if not cfg:
+        return (
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
+
+    return (
+        gr.update(value=float(cfg["blur"])),
+        gr.update(value=float(cfg["grain"])),
+        gr.update(value=float(cfg["vignette"])),
+        gr.update(value=float(cfg["brightness"])),
+        gr.update(value=float(cfg["saturation"])),
+        gr.update(value=float(cfg["contrast"])),
+        gr.update(value=float(cfg["plate"])),
+    )
+
+
+def _normalize_bg_preset_name(s: str) -> str:
+    x = (s or "").strip().lower()
+    x = re.sub(r"\s+", " ", x)
+    return x
+
+
+def _recommend_bg_preset_from_meta(meta_path: str) -> str:
+    """Heuristic preset when LLM prompt pack is missing.
+
+    Uses the style/genre keywords from meta.json.
+    """
+
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        return "Cinematic Soft"
+
+    style = str(meta.get("style") or "").lower()
+    caption = str(meta.get("caption") or "").lower()
+    blob = style + "\n" + caption
+    if any(
+        k in blob
+        for k in (
+            "edm",
+            "club",
+            "dance",
+            "techno",
+            "house",
+            "trance",
+            "dnb",
+            "drum",
+            "bass",
+        )
+    ):
+        return "Dark Club"
+    if any(
+        k in blob
+        for k in (
+            "lofi",
+            "lo-fi",
+            "acoustic",
+            "ballad",
+            "folk",
+            "indie",
+            "warm",
+            "vintage",
+        )
+    ):
+        return "Warm Film"
+    if any(k in blob for k in ("rock", "metal", "punk")):
+        return "Crisp"
+    return "Cinematic Soft"
+
+
+def apply_recommended_bg_preset(
+    run_folder: str,
+    visual_prompt_json: str,
+) -> tuple[str, str]:
+    """Pick preset from visual_prompt.json (LLM) or fallback to meta.json."""
+
+    run_folder = (run_folder or "").strip()
+    rec = ""
+    # Prefer LLM recommendation.
+    vp = (visual_prompt_json or "").strip()
+    if vp and os.path.isfile(vp):
+        try:
+            with open(vp, "r", encoding="utf-8") as f:
+                pack = json.load(f)
+            rec = str(pack.get("recommended_bg_preset") or "").strip()
+        except Exception:
+            rec = ""
+
+    if not rec and run_folder and os.path.isdir(run_folder):
+        meta = os.path.join(run_folder, "meta.json")
+        if os.path.isfile(meta):
+            rec = _recommend_bg_preset_from_meta(meta)
+
+    if not rec:
+        rec = "Cinematic Soft"
+
+    # Normalize to our dropdown values.
+    m = {
+        "cinematic soft": "Cinematic Soft",
+        "warm film": "Warm Film",
+        "dark club": "Dark Club",
+        "crisp": "Crisp",
+    }
+    key = _normalize_bg_preset_name(rec)
+    out = m.get(key)
+    if not out:
+        out = "Cinematic Soft"
+    return (out, f"Applied BG preset: {out}")
 
 
 def _combine_style(style: str, genres: list[str]) -> str:
@@ -424,6 +838,65 @@ def _make_server_state() -> dict:
         "started_at": None,
         "acestep_dir": "",
     }
+
+
+def _make_comfy_state() -> dict:
+    return {
+        "proc": None,
+        "log_lines": [],
+        "started_at": None,
+        "bat_path": "",
+    }
+
+
+def _split_args(arg_string: str) -> list[str]:
+    """Split a command-line arg string into argv safely."""
+
+    s = (arg_string or "").strip()
+    if not s:
+        return []
+    try:
+        return shlex.split(s, posix=False)
+    except Exception:
+        return [x for x in s.split(" ") if x]
+
+
+def _resolve_path(repo_root: str, p: str) -> str:
+    """Resolve a user-provided path relative to repo root when needed."""
+    p = (p or "").strip()
+    if not p:
+        return ""
+    if os.path.isabs(p):
+        return os.path.normpath(p)
+    return os.path.normpath(os.path.abspath(os.path.join(repo_root, p)))
+
+
+def _tcp_is_open(host: str, port: int, timeout_s: float = 0.6) -> bool:
+    import socket
+
+    s = None
+    try:
+        s = socket.socket()
+        s.settimeout(timeout_s)
+        return s.connect_ex((host, int(port))) == 0
+    except Exception:
+        return False
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def _parse_http_host_port(url: str, default_port: int) -> tuple[str, int]:
+    try:
+        u = urllib.parse.urlparse((url or "").strip())
+        host = u.hostname or "127.0.0.1"
+        port = int(u.port or default_port)
+        return host, port
+    except Exception:
+        return "127.0.0.1", int(default_port)
 
 
 def _append_log(state: dict, line: str) -> None:
@@ -543,6 +1016,19 @@ def _append_server_log(state: dict, line: str) -> None:
         state["log_lines"] = state["log_lines"][len(state["log_lines"]) - 800 :]
 
 
+def _comfy_log_text(state: dict) -> str:
+    return "\n".join(state.get("log_lines") or [])
+
+
+def _append_comfy_log(state: dict, line: str) -> None:
+    if not line:
+        return
+    s = line.rstrip("\r\n")
+    state["log_lines"].append(s)
+    if len(state["log_lines"]) > 800:
+        state["log_lines"] = state["log_lines"][len(state["log_lines"]) - 800 :]
+
+
 def _is_proc_running(p) -> bool:
     try:
         return p is not None and p.poll() is None
@@ -645,7 +1131,7 @@ def select_history_run(selected: str, runs_json: str):
 def start_run(
     topic: str,
     style: str,
-    genres: list[str],
+    genres: list[str] | None,
     batch_count: int,
     reroll_mode: str,
     reroll_on_first: bool,
@@ -673,6 +1159,8 @@ def start_run(
             state.get("audio_path") or None,
             state.get("meta_path") or None,
             state,
+            (topic or "").strip(),
+            _combine_style((style or "").strip(), genres or []),
         )
         return
 
@@ -680,7 +1168,7 @@ def start_run(
     seed_topic = (topic or "").strip()
     seed_style = (style or "").strip()
 
-    genres, trim_msg = _enforce_max_genres(genres)
+    genres, trim_msg = _enforce_max_genres(genres or [])
     # Reroll mode normalization
     reroll_mode = (reroll_mode or "None").strip()
     if reroll_mode not in ("None", "Topic from Style", "Style from Topic", "Both"):
@@ -906,6 +1394,8 @@ def start_run(
                 None,
                 None,
                 state,
+                cur_topic,
+                combined_style,
             )
             return
 
@@ -1001,6 +1491,8 @@ def stop_run(state: dict):
             state.get("audio_path") or None,
             state.get("meta_path") or None,
             state,
+            "",
+            "",
         )
 
     try:
@@ -1037,7 +1529,309 @@ def open_output_folder(out_dir: str) -> str:
         return f"Failed to open: {e}"
 
 
-def start_acestep_server(acestep_api: str, server_state: dict):
+def open_run_folder_from_history(folder: str) -> str:
+    if not folder:
+        return "No run folder selected."
+    if not os.path.isdir(folder):
+        return f"Folder not found: {folder}"
+    try:
+        os.startfile(folder)  # type: ignore[attr-defined]
+        return f"Opened: {folder}"
+    except Exception as e:
+        return f"Failed to open: {e}"
+
+
+def _find_audio_in_run(folder: str) -> str:
+    for fn in ("audio.mp3", "audio.wav", "audio.flac"):
+        p = os.path.join(folder, fn)
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def render_lyric_video(
+    run_folder: str,
+    outdir: str,
+    video_preset: str,
+    lyric_offset: float,
+    auto_lead_in: bool,
+    bg_video_path: str,
+    bg_mode: str,
+    bg_crossfade_s: float,
+    viz_mode: str,
+    viz_opacity: float,
+    bg_blur: float,
+    bg_grain: float,
+    bg_vignette: float,
+    bg_brightness: float,
+    bg_saturation: float,
+    bg_contrast: float,
+    plate_alpha: float,
+) -> tuple[str, str]:
+    """Render lyric video for the selected run folder.
+
+    Returns: (status, video_path)
+    """
+
+    run_folder = (run_folder or "").strip()
+    if not run_folder:
+        return "No run selected.", ""
+    if not os.path.isdir(run_folder):
+        return f"Folder not found: {run_folder}", ""
+
+    meta = os.path.join(run_folder, "meta.json")
+    if not os.path.isfile(meta):
+        return f"Missing meta.json: {meta}", ""
+    audio = _find_audio_in_run(run_folder)
+    if not audio:
+        return "Missing audio file in run folder.", ""
+
+    # Use the standalone renderer.
+    repo_root = os.path.abspath(os.path.dirname(__file__))
+    script = os.path.join(repo_root, "video_lyrics.py")
+    if not os.path.isfile(script):
+        return f"Missing: {script}", ""
+
+    preset = (video_preset or "hd16x9").strip() or "hd16x9"
+    # Place output next to the run, so it stays with the audio/meta.
+    out_path = os.path.join(run_folder, f"lyrics_video_{preset}.mp4")
+
+    bgp = (bg_video_path or "").strip()
+    if not bgp:
+        cand = os.path.join(run_folder, "bg_loop.mp4")
+        if os.path.isfile(cand):
+            bgp = cand
+
+    cmd = [
+        sys.executable,
+        script,
+        "--run-dir",
+        run_folder,
+        "--out",
+        out_path,
+        "--preset",
+        preset,
+        "--fps",
+        "30",
+        "--timing",
+        "smart",
+        "--offset",
+        str(float(lyric_offset or 0.0)),
+        ("--auto-lead-in" if bool(auto_lead_in) else "--no-auto-lead-in"),
+        "--font",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+
+    if bgp:
+        cmd += ["--bg-video", bgp]
+
+    bmode = (bg_mode or "auto").strip() or "auto"
+    cmd += ["--bg-mode", bmode]
+    cmd += ["--bg-crossfade", str(float(bg_crossfade_s or 0.6))]
+    cmd += ["--viz", (viz_mode or "off").strip() or "off"]
+    cmd += ["--viz-opacity", str(float(viz_opacity or 0.18))]
+    cmd += ["--bg-blur", str(float(bg_blur or 0.0))]
+    cmd += ["--bg-grain", str(float(bg_grain or 0.0))]
+    cmd += ["--bg-vignette", str(float(bg_vignette or 0.0))]
+    cmd += ["--bg-brightness", str(float(bg_brightness or 0.0))]
+    cmd += ["--bg-saturation", str(float(bg_saturation or 1.0))]
+    cmd += ["--bg-contrast", str(float(bg_contrast or 1.0))]
+    cmd += ["--plate-alpha", str(float(plate_alpha or 0.0))]
+
+    try:
+        r = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True)
+        if r.returncode != 0:
+            msg = (r.stdout or "").strip()
+            err = (r.stderr or "").strip()
+            detail = (err or msg or "unknown error").strip()
+            return ("Video render failed: " + detail), ""
+    except FileNotFoundError:
+        return (
+            "Video render failed: ffmpeg not found. Install FFmpeg (add to PATH) or add tools/ffmpeg.exe.",
+            "",
+        )
+    except Exception as e:
+        return f"Video render failed: {e}", ""
+
+    if os.path.isfile(out_path):
+        return "Video saved.", out_path
+    return "Video render finished but file not found.", ""
+
+
+def auto_sync_lyrics(
+    run_folder: str,
+    use_gpu: bool,
+    use_demucs: bool,
+    whisper_model: str,
+    words_per_segment: int,
+    max_segment_s: float,
+    lead_s: float,
+) -> tuple[str, str]:
+    """Run align_lyrics.py to compute per-line timings."""
+
+    run_folder = (run_folder or "").strip()
+    if not run_folder:
+        return "No run selected.", ""
+    if not os.path.isdir(run_folder):
+        return f"Folder not found: {run_folder}", ""
+
+    meta = os.path.join(run_folder, "meta.json")
+    if not os.path.isfile(meta):
+        return f"Missing meta.json: {meta}", ""
+    audio = _find_audio_in_run(run_folder)
+    if not audio:
+        return "Missing audio file in run folder.", ""
+
+    repo_root = os.path.abspath(os.path.dirname(__file__))
+    script = os.path.join(repo_root, "align_lyrics.py")
+    if not os.path.isfile(script):
+        return f"Missing: {script}", ""
+
+    model = (whisper_model or "small").strip() or "small"
+    if model not in ("tiny", "base", "small", "medium"):
+        model = "small"
+
+    # Use embedded python (sys.executable) so it shares deps with Gradio/ACE-Step.
+    cmd = [
+        sys.executable,
+        script,
+        "--run-dir",
+        run_folder,
+        "--language",
+        "en",
+        "--mode",
+        "auto",
+        "--use-gpu" if bool(use_gpu) else "--no-use-gpu",
+        "--demucs" if bool(use_demucs) else "--no-demucs",
+        "--model",
+        model,
+        "--words-per-segment",
+        str(int(words_per_segment or 6)),
+        "--max-segment-s",
+        str(float(max_segment_s or 2.2)),
+        "--lead",
+        str(float(lead_s or 0.0)),
+    ]
+
+    try:
+        r = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True)
+        if r.returncode != 0:
+            msg = (r.stdout or "").strip()
+            err = (r.stderr or "").strip()
+            detail = (err or msg or "unknown error").strip()
+            return ("Auto Sync failed: " + detail), ""
+        # Prefer report file if present.
+        report_path = os.path.join(run_folder, "alignment_report.json")
+        if os.path.isfile(report_path):
+            try:
+                with open(report_path, "r", encoding="utf-8") as f:
+                    rep = json.load(f)
+                avg = float(rep.get("avg_coverage") or 0.0)
+                low = int(rep.get("low_confidence_lines") or 0)
+                return (
+                    f"Auto Sync complete. avg_coverage={avg:.2f}, low_lines={low}"
+                ), report_path
+            except Exception:
+                pass
+        out = (r.stdout or "").strip()
+        return (out or "Auto Sync complete."), ""
+    except Exception as e:
+        return f"Auto Sync failed: {e}", ""
+
+
+def generate_bg_loop(
+    run_folder: str,
+    comfy_url: str,
+    ckpt_name: str,
+    loop_seconds: float,
+    quality: str,
+    use_llm: bool,
+    llm_base: str,
+    llm_model: str,
+    llm_api_key: str,
+) -> tuple[str, str, str]:
+    """Generate bg_loop.mp4 in the selected run folder."""
+
+    run_folder = (run_folder or "").strip()
+    if not run_folder:
+        return "No run selected.", "", ""
+    if not os.path.isdir(run_folder):
+        return f"Folder not found: {run_folder}", "", ""
+
+    meta = os.path.join(run_folder, "meta.json")
+    if not os.path.isfile(meta):
+        return f"Missing meta.json: {meta}", "", ""
+
+    repo_root = os.path.abspath(os.path.dirname(__file__))
+    script = os.path.join(repo_root, "generate_bg_loop.py")
+    if not os.path.isfile(script):
+        return f"Missing: {script}", "", ""
+
+    ckpt = (ckpt_name or "").strip() or "sd_xl_turbo_1.0.safetensors"
+    comfy = (comfy_url or "http://127.0.0.1:8188").strip() or "http://127.0.0.1:8188"
+    loop_s = float(loop_seconds or 8.0)
+    out_mp4 = os.path.join(run_folder, "bg_loop.mp4")
+
+    cmd = [
+        sys.executable,
+        script,
+        "--run-dir",
+        run_folder,
+        "--comfy-url",
+        comfy,
+        "--ckpt",
+        ckpt,
+        "--quality",
+        str(quality or "fast"),
+        "--loop-seconds",
+        f"{loop_s:.3f}",
+        "--out",
+        out_mp4,
+        "--llm-base",
+        str(llm_base),
+        "--llm-model",
+        str(llm_model),
+        "--llm-api-key",
+        str(llm_api_key),
+    ]
+    # Generate all scene variants so bg_mode=sections works.
+    cmd += ["--scenes", "base,verse,chorus,bridge"]
+    cmd += ["--use-llm" if bool(use_llm) else "--no-use-llm"]
+
+    try:
+        r = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True)
+        if r.returncode != 0:
+            msg = (r.stdout or "").strip()
+            err = (r.stderr or "").strip()
+            detail = (err or msg or "unknown error").strip()
+            return ("BG loop failed: " + detail), "", ""
+    except Exception as e:
+        return f"BG loop failed: {e}", "", ""
+
+    keyframe = os.path.join(run_folder, "bg_keyframe.png")
+    prompt_pack = os.path.join(run_folder, "visual_prompt.json")
+    if os.path.isfile(out_mp4):
+        # If LLM recommended a background preset, return it in status.
+        rec = ""
+        if os.path.isfile(prompt_pack):
+            try:
+                with open(prompt_pack, "r", encoding="utf-8") as f:
+                    pack = json.load(f)
+                rec = str(pack.get("recommended_bg_preset") or "").strip()
+            except Exception:
+                rec = ""
+        msg = "BG loop saved."
+        if rec:
+            msg += f" Recommended preset: {rec}"
+        return (msg, out_mp4, (prompt_pack if os.path.isfile(prompt_pack) else ""))
+    return (
+        "BG loop finished but file not found.",
+        "",
+        (prompt_pack if os.path.isfile(prompt_pack) else ""),
+    )
+
+
+def start_acestep_server(acestep_api: str, acestep_dir_input: str, server_state: dict):
     # If already healthy, no-op.
     try:
         _http_get_json(acestep_api.rstrip("/") + "/health", timeout=2.0)
@@ -1054,7 +1848,7 @@ def start_acestep_server(acestep_api: str, server_state: dict):
         )
 
     repo_root = os.path.abspath(os.path.dirname(__file__))
-    acestep_dir = os.path.join(repo_root, "ACE-Step-1.5")
+    acestep_dir = _resolve_path(repo_root, acestep_dir_input or "ACE-Step-1.5")
     bat = os.path.join(acestep_dir, "start_api_server.bat")
     if not os.path.isfile(bat):
         _append_server_log(server_state, f"Missing: {bat}")
@@ -1066,8 +1860,9 @@ def start_acestep_server(acestep_api: str, server_state: dict):
 
     _append_server_log(server_state, "Starting ACE-Step server...")
     try:
+        # .bat requires cmd.exe on Windows.
         p = subprocess.Popen(
-            [bat],
+            ["cmd.exe", "/c", bat],
             cwd=acestep_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1092,6 +1887,170 @@ def start_acestep_server(acestep_api: str, server_state: dict):
 
     threading.Thread(target=_reader, daemon=True).start()
     return _server_log_text(server_state), "ACE-Step launch started.", server_state
+
+
+def start_comfyui_server(
+    comfy_url: str,
+    comfy_bat_input: str,
+    comfy_args: str,
+    comfy_state: dict,
+):
+    # If already reachable, no-op.
+    host, port = _parse_http_host_port(comfy_url or "http://127.0.0.1:8188", 8188)
+    if _tcp_is_open(host, port, timeout_s=0.5):
+        return _comfy_log_text(comfy_state), "ComfyUI already reachable.", comfy_state
+
+    proc = comfy_state.get("proc")
+    if _is_proc_running(proc):
+        return (
+            _comfy_log_text(comfy_state),
+            "ComfyUI launch already in progress.",
+            comfy_state,
+        )
+
+    repo_root = os.path.abspath(os.path.dirname(__file__))
+    bat = _resolve_path(repo_root, comfy_bat_input)
+    if not bat or not os.path.isfile(bat):
+        _append_comfy_log(comfy_state, "Missing ComfyUI .bat path.")
+        if bat:
+            _append_comfy_log(comfy_state, f"Missing: {bat}")
+        return (
+            _comfy_log_text(comfy_state),
+            "ComfyUI start .bat not found.",
+            comfy_state,
+        )
+
+    comfy_dir = os.path.dirname(bat)
+    host, port = _parse_http_host_port(comfy_url or "http://127.0.0.1:8188", 8188)
+    extra = _split_args(comfy_args)
+
+    _append_comfy_log(comfy_state, "Starting ComfyUI...")
+
+    # If this looks like the portable build launcher, run python directly so we
+    # can append memory-saving flags.
+    py = os.path.join(comfy_dir, "python_embeded", "python.exe")
+    main_py = os.path.join(comfy_dir, "ComfyUI", "main.py")
+    try:
+        if os.path.isfile(py) and os.path.isfile(main_py):
+            cmd = [
+                py,
+                "-s",
+                main_py,
+                "--windows-standalone-build",
+                "--disable-auto-launch",
+                "--listen",
+                str(host),
+                "--port",
+                str(int(port)),
+            ]
+            cmd += extra
+            _append_comfy_log(comfy_state, "Command: " + " ".join(cmd))
+            p = subprocess.Popen(
+                cmd,
+                cwd=comfy_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        else:
+            _append_comfy_log(comfy_state, f"Command: {bat}")
+            p = subprocess.Popen(
+                ["cmd.exe", "/c", bat],
+                cwd=comfy_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+    except Exception as e:
+        _append_comfy_log(comfy_state, f"Launch error: {e}")
+        return _comfy_log_text(comfy_state), "Launch failed.", comfy_state
+
+    comfy_state["proc"] = p
+    comfy_state["started_at"] = time.time()
+    comfy_state["bat_path"] = bat
+
+    def _reader():
+        try:
+            assert p.stdout is not None
+            for line in p.stdout:
+                _append_comfy_log(comfy_state, line)
+        except Exception as e:
+            _append_comfy_log(comfy_state, f"Reader error: {e}")
+
+    threading.Thread(target=_reader, daemon=True).start()
+    return _comfy_log_text(comfy_state), "ComfyUI launch started.", comfy_state
+
+
+def stop_comfyui_server(comfy_state: dict):
+    proc = comfy_state.get("proc")
+    if not _is_proc_running(proc):
+        return (
+            _comfy_log_text(comfy_state),
+            "No managed ComfyUI process to stop.",
+            comfy_state,
+        )
+
+    pid = getattr(proc, "pid", None)
+    if not pid:
+        return _comfy_log_text(comfy_state), "Missing PID.", comfy_state
+
+    ok, msg = _taskkill_tree(int(pid))
+    _append_comfy_log(comfy_state, f"Stop: {msg}")
+    comfy_state["proc"] = None
+    return (
+        _comfy_log_text(comfy_state),
+        ("Stopped." if ok else "Stop attempted (see log)."),
+        comfy_state,
+    )
+
+
+def poll_managed_logs(
+    enabled_sys: bool,
+    enabled_gen: bool,
+    acestep_api: str,
+    comfy_url: str,
+    server_state: dict,
+    comfy_state: dict,
+):
+    """Periodic UI updater for managed server logs.
+
+    Only shows live output for processes started via the WebUI buttons.
+    """
+
+    enabled = bool(enabled_sys) or bool(enabled_gen)
+    if not enabled:
+        return gr.update(), gr.update(), gr.update(), gr.update()
+
+    # ACE-Step status
+    s_proc = server_state.get("proc")
+    s_running = _is_proc_running(s_proc)
+    s_pid = getattr(s_proc, "pid", None) if s_running else None
+    host, port = _parse_http_host_port(acestep_api or "http://127.0.0.1:8001", 8001)
+    s_reach = _tcp_is_open(host, port, timeout_s=0.2)
+    s_status = f"Managed: {'running' if s_running else 'stopped'}"
+    if s_pid:
+        s_status += f" (pid {s_pid})"
+    s_status += f"; API: {'reachable' if s_reach else 'down'}"
+
+    # ComfyUI status
+    c_proc = comfy_state.get("proc")
+    c_running = _is_proc_running(c_proc)
+    c_pid = getattr(c_proc, "pid", None) if c_running else None
+    chost, cport = _parse_http_host_port(comfy_url or "http://127.0.0.1:8188", 8188)
+    c_reach = _tcp_is_open(chost, cport, timeout_s=0.2)
+    c_status = f"Managed: {'running' if c_running else 'stopped'}"
+    if c_pid:
+        c_status += f" (pid {c_pid})"
+    c_status += f"; URL: {'reachable' if c_reach else 'down'}"
+
+    return (
+        _server_log_text(server_state),
+        s_status,
+        _comfy_log_text(comfy_state),
+        c_status,
+    )
 
 
 def stop_acestep_server(server_state: dict):
@@ -1123,164 +2082,597 @@ def main() -> int:
     default_llm_base = os.environ.get("LLM_BASE_URL", "http://localhost:8317/v1")
     default_llm_model = os.environ.get("LLM_MODEL", "gpt-5.2")
     default_acestep_api = os.environ.get("ACESTEP_API_BASE", "http://127.0.0.1:8001")
+    default_acestep_dir = os.environ.get("ACESTEP_DIR", "ACE-Step-1.5")
+    default_comfy_bat = os.environ.get("COMFYUI_START_BAT", "")
+    default_comfy_args = os.environ.get(
+        "COMFYUI_ARGS",
+        "--cache-none --disable-all-custom-nodes --normalvram",
+    )
+    default_bg_quality = os.environ.get("BG_QUALITY", "fast")
 
-    with gr.Blocks(title="AceStepAuto WebUI") as demo:
+    css = """
+    .as-btn-row { gap: 10px !important; flex-wrap: wrap !important; }
+    .as-btn-row button { min-height: 42px; }
+    .as-card { border-radius: 14px; }
+    """.strip()
+
+    # No auto-tab switching; results are shown alongside settings.
+
+    with gr.Blocks(title="AceStepAuto WebUI", css=css) as demo:
         gr.Markdown("# AceStepAuto WebUI")
 
         state = gr.State(_make_runner_state())
         server_state = gr.State(_make_server_state())
+        comfy_state = gr.State(_make_comfy_state())
 
-        with gr.Row():
-            status_btn = gr.Button("Refresh Status", variant="secondary")
-            status_box = gr.Textbox(
-                label="Server Status", value="", lines=2, interactive=False
-            )
+        with gr.Tabs(elem_classes=["as-card"]) as tabs:
+            with gr.Tab("Generate", id="generate"):
+                with gr.Row():
+                    # 3-column workspace:
+                    # - Left: idea tools
+                    # - Middle: status + run settings
+                    # - Right: results (run status/logs/files/history)
+                    with gr.Column(scale=4, min_width=380):
+                        with gr.Group(elem_classes=["as-card"]):
+                            gr.Markdown("## Idea Tools")
+                            topic = gr.Textbox(label="Topic", value="first love")
+                            style = gr.Textbox(label="Style", value="k-pop dance pop")
+                            genres = gr.CheckboxGroup(
+                                label="Genres (pick up to 5)",
+                                choices=GENRES_TOP20,
+                                value=[],
+                            )
+                            genres_note = gr.Textbox(
+                                label="Genres Note", value="", interactive=False
+                            )
 
-        with gr.Row():
-            srv_start_btn = gr.Button("Start ACE-Step Server", variant="primary")
-            srv_stop_btn = gr.Button("Stop ACE-Step Server", variant="stop")
-            srv_status = gr.Textbox(
-                label="ACE-Step Control", value="", interactive=False
-            )
+                            with gr.Row(elem_classes=["as-btn-row"]):
+                                suggest_topic_btn = gr.Button(
+                                    "Suggest Topic From Style", variant="secondary"
+                                )
+                                suggest_style_btn = gr.Button(
+                                    "Suggest Style From Topic", variant="secondary"
+                                )
+                                random_idea_btn = gr.Button(
+                                    "Random Topic + Style", variant="primary"
+                                )
+                            suggest_status = gr.Textbox(
+                                label="Idea Tool Status", value="", interactive=False
+                            )
 
-        srv_log = gr.Textbox(
-            label="ACE-Step Server Log (managed)", value="", lines=8, interactive=False
-        )
+                        with gr.Group(elem_classes=["as-card"]):
+                            gr.Markdown("## Server Logs (managed)")
+                            gr.Markdown(
+                                "Live output is available only for servers started from the WebUI buttons."
+                            )
+                            live_logs_gen = gr.Checkbox(label="Live Logs", value=True)
+                            srv_status_gen = gr.Textbox(
+                                label="ACE-Step Control", value="", interactive=False
+                            )
+                            srv_log_gen = gr.Textbox(
+                                label="ACE-Step Server Log (managed)",
+                                value="",
+                                lines=7,
+                                interactive=False,
+                            )
+                            comfy_status_gen = gr.Textbox(
+                                label="ComfyUI Control", value="", interactive=False
+                            )
+                            comfy_log_gen = gr.Textbox(
+                                label="ComfyUI Server Log (managed)",
+                                value="",
+                                lines=7,
+                                interactive=False,
+                            )
 
-        with gr.Row():
-            with gr.Column(scale=2):
-                topic = gr.Textbox(label="Topic", value="first love")
-                style = gr.Textbox(label="Style", value="k-pop dance pop")
-                genres = gr.CheckboxGroup(
-                    label="Genres (pick up to 5)", choices=GENRES_TOP20, value=[]
-                )
-                genres_note = gr.Textbox(
-                    label="Genres Note", value="", interactive=False
-                )
+                    with gr.Column(scale=3, min_width=340):
+                        with gr.Group(elem_classes=["as-card"]):
+                            gr.Markdown("## Status")
+                            with gr.Row(elem_classes=["as-btn-row"]):
+                                status_btn = gr.Button(
+                                    "Refresh Status", variant="secondary"
+                                )
+                                status_box = gr.Textbox(
+                                    label="Server Status",
+                                    value="",
+                                    lines=2,
+                                    interactive=False,
+                                )
+
+                        with gr.Group(elem_classes=["as-card"]):
+                            gr.Markdown("## Server Control")
+                            with gr.Row(elem_classes=["as-btn-row"]):
+                                gen_srv_start = gr.Button(
+                                    "Start ACE-Step", variant="secondary"
+                                )
+                                gen_srv_stop = gr.Button(
+                                    "Stop ACE-Step", variant="stop"
+                                )
+                                gen_comfy_start = gr.Button(
+                                    "Start ComfyUI", variant="secondary"
+                                )
+                                gen_comfy_stop = gr.Button(
+                                    "Stop ComfyUI", variant="stop"
+                                )
+
+                        with gr.Group(elem_classes=["as-card"]):
+                            gr.Markdown("## Run Settings")
+                            lang = gr.Textbox(label="Language", value="en")
+                            with gr.Row():
+                                duration = gr.Slider(
+                                    label="Duration (sec)",
+                                    minimum=10,
+                                    maximum=210,
+                                    step=1,
+                                    value=30,
+                                )
+                                audio_format = gr.Dropdown(
+                                    label="Audio Format",
+                                    choices=["mp3", "wav", "flac"],
+                                    value="mp3",
+                                )
+
+                            with gr.Row():
+                                batch_size = gr.Slider(
+                                    label="Batch Size",
+                                    minimum=1,
+                                    maximum=8,
+                                    step=1,
+                                    value=1,
+                                )
+                                inference_steps = gr.Slider(
+                                    label="Inference Steps",
+                                    minimum=1,
+                                    maximum=50,
+                                    step=1,
+                                    value=8,
+                                )
+
+                            with gr.Row():
+                                thinking = gr.Checkbox(label="Thinking", value=False)
+                                skip_format = gr.Checkbox(
+                                    label="Skip /format_input", value=False
+                                )
+
+                            batch_count = gr.Slider(
+                                label="Batch Count (sequential)",
+                                minimum=1,
+                                maximum=20,
+                                step=1,
+                                value=1,
+                            )
+
+                            with gr.Row():
+                                reroll_mode = gr.Dropdown(
+                                    label="Batch Re-suggest",
+                                    choices=[
+                                        "None",
+                                        "Topic from Style",
+                                        "Style from Topic",
+                                        "Both",
+                                    ],
+                                    value="None",
+                                )
+                                reroll_on_first = gr.Checkbox(
+                                    label="Re-suggest on run #1", value=False
+                                )
+
+                            with gr.Row(elem_classes=["as-btn-row"]):
+                                start_btn = gr.Button("Start", variant="primary")
+                                stop_btn = gr.Button("Stop", variant="stop")
+
+                    with gr.Column(scale=4, min_width=420):
+                        with gr.Group(elem_classes=["as-card"]):
+                            gr.Markdown("## Results")
+                            run_status = gr.Textbox(
+                                label="Run Status", value="Idle.", interactive=False
+                            )
+                            effective_topic = gr.Textbox(
+                                label="Effective Topic (current run)",
+                                value="",
+                                interactive=False,
+                            )
+                            effective_style = gr.Textbox(
+                                label="Effective Style (includes genres)",
+                                value="",
+                                interactive=False,
+                            )
+
+                            outdir = gr.Textbox(label="Output Folder", value="output")
+                            out_dir_box = gr.Textbox(
+                                label="Latest Output Directory",
+                                value="",
+                                interactive=False,
+                            )
+
+                            with gr.Group(elem_classes=["as-card"]):
+                                gr.Markdown("## Video Builder")
+
+                                with gr.Accordion(
+                                    "1) Background (optional)", open=True
+                                ):
+                                    with gr.Row(elem_classes=["as-btn-row"]):
+                                        comfy_url = gr.Textbox(
+                                            label="ComfyUI URL",
+                                            value="http://127.0.0.1:8188",
+                                        )
+
+                                    with gr.Row(elem_classes=["as-btn-row"]):
+                                        ckpt_name = gr.Dropdown(
+                                            label="Checkpoint",
+                                            choices=[
+                                                "v1-5-pruned-emaonly-fp16.safetensors",
+                                                "sd_xl_turbo_1.0.safetensors",
+                                                "flux1-dev-fp8.safetensors",
+                                                "sd3.5_large_fp8_scaled.safetensors",
+                                            ],
+                                            value="v1-5-pruned-emaonly-fp16.safetensors",
+                                        )
+                                        bg_quality = gr.Dropdown(
+                                            label="Quality",
+                                            choices=["fast", "balanced", "high"],
+                                            value=default_bg_quality
+                                            if default_bg_quality
+                                            in ("fast", "balanced", "high")
+                                            else "fast",
+                                        )
+                                        bg_loop_seconds = gr.Slider(
+                                            label="Loop Seconds",
+                                            minimum=4.0,
+                                            maximum=12.0,
+                                            step=0.5,
+                                            value=8.0,
+                                        )
+                                        bg_use_llm = gr.Checkbox(
+                                            label="Use LLM", value=True
+                                        )
+
+                                    with gr.Row(elem_classes=["as-btn-row"]):
+                                        bg_btn = gr.Button(
+                                            "Generate BG Loop", variant="primary"
+                                        )
+                                        bg_status = gr.Textbox(
+                                            label="BG Status",
+                                            value="",
+                                            interactive=False,
+                                        )
+
+                                    with gr.Row():
+                                        bg_file = gr.File(label="Background Loop (mp4)")
+                                        bg_prompt_file = gr.File(
+                                            label="Visual Prompt (json)"
+                                        )
+
+                                    with gr.Accordion("Playback + Overlay", open=False):
+                                        bg_video_path = gr.Textbox(
+                                            label="BG Video Path Override",
+                                            value="",
+                                            placeholder="Leave blank to use run_dir/bg_loop.mp4",
+                                        )
+
+                                        with gr.Row(elem_classes=["as-btn-row"]):
+                                            bg_mode = gr.Dropdown(
+                                                label="Mode",
+                                                choices=[
+                                                    "auto",
+                                                    "single",
+                                                    "sections",
+                                                ],
+                                                value="auto",
+                                            )
+                                            bg_crossfade = gr.Slider(
+                                                label="Crossfade (sec)",
+                                                minimum=0.2,
+                                                maximum=1.5,
+                                                step=0.05,
+                                                value=0.6,
+                                            )
+                                            viz_mode = gr.Dropdown(
+                                                label="Audio Viz",
+                                                choices=[
+                                                    "off",
+                                                    "spectrum",
+                                                    "waveform",
+                                                ],
+                                                value="spectrum",
+                                            )
+                                            viz_opacity = gr.Slider(
+                                                label="Viz Opacity",
+                                                minimum=0.0,
+                                                maximum=0.6,
+                                                step=0.02,
+                                                value=0.18,
+                                            )
+
+                                    with gr.Accordion("Look + Preset", open=False):
+                                        with gr.Row(elem_classes=["as-btn-row"]):
+                                            bg_preset = gr.Dropdown(
+                                                label="Preset",
+                                                choices=[
+                                                    "Cinematic Soft",
+                                                    "Warm Film",
+                                                    "Dark Club",
+                                                    "Crisp",
+                                                    "Custom",
+                                                ],
+                                                value="Cinematic Soft",
+                                            )
+                                            apply_bg_preset_btn = gr.Button(
+                                                "Apply Recommended",
+                                                variant="secondary",
+                                            )
+                                            apply_bg_preset_status = gr.Textbox(
+                                                label="Preset Status",
+                                                value="",
+                                                interactive=False,
+                                            )
+
+                                        with gr.Row(elem_classes=["as-btn-row"]):
+                                            bg_blur = gr.Slider(
+                                                label="Blur",
+                                                minimum=0.0,
+                                                maximum=10.0,
+                                                step=0.2,
+                                                value=2.8,
+                                            )
+                                            bg_grain = gr.Slider(
+                                                label="Grain",
+                                                minimum=0.0,
+                                                maximum=25.0,
+                                                step=0.5,
+                                                value=10.0,
+                                            )
+                                            bg_vignette = gr.Slider(
+                                                label="Vignette",
+                                                minimum=0.0,
+                                                maximum=1.0,
+                                                step=0.05,
+                                                value=0.6,
+                                            )
+
+                                        with gr.Row(elem_classes=["as-btn-row"]):
+                                            bg_brightness = gr.Slider(
+                                                label="Brightness",
+                                                minimum=-0.25,
+                                                maximum=0.15,
+                                                step=0.01,
+                                                value=-0.04,
+                                            )
+                                            bg_saturation = gr.Slider(
+                                                label="Saturation",
+                                                minimum=0.6,
+                                                maximum=1.6,
+                                                step=0.02,
+                                                value=1.08,
+                                            )
+                                            bg_contrast = gr.Slider(
+                                                label="Contrast",
+                                                minimum=0.7,
+                                                maximum=1.4,
+                                                step=0.02,
+                                                value=1.06,
+                                            )
+                                            plate_alpha = gr.Slider(
+                                                label="Lyric Plate",
+                                                minimum=0.0,
+                                                maximum=0.6,
+                                                step=0.02,
+                                                value=0.30,
+                                            )
+
+                                with gr.Accordion(
+                                    "2) Auto Sync Lyrics (recommended)", open=False
+                                ):
+                                    with gr.Row(elem_classes=["as-btn-row"]):
+                                        sync_use_gpu = gr.Checkbox(
+                                            label="Use GPU", value=True
+                                        )
+                                        sync_demucs = gr.Checkbox(
+                                            label="Demucs (vocals)",
+                                            value=True,
+                                        )
+                                        sync_model = gr.Dropdown(
+                                            label="Whisper Model",
+                                            choices=[
+                                                "tiny",
+                                                "base",
+                                                "small",
+                                                "medium",
+                                            ],
+                                            value="small",
+                                        )
+
+                                    with gr.Accordion("Sync Timing", open=False):
+                                        with gr.Row(elem_classes=["as-btn-row"]):
+                                            sync_words = gr.Slider(
+                                                label="Words/Segment",
+                                                minimum=3,
+                                                maximum=10,
+                                                step=1,
+                                                value=6,
+                                            )
+                                            sync_max_seg = gr.Slider(
+                                                label="Max Segment (sec)",
+                                                minimum=0.8,
+                                                maximum=4.0,
+                                                step=0.1,
+                                                value=2.2,
+                                            )
+                                            sync_lead = gr.Slider(
+                                                label="Lead (sec)",
+                                                minimum=-0.6,
+                                                maximum=0.6,
+                                                step=0.05,
+                                                value=-0.15,
+                                            )
+
+                                    with gr.Row(elem_classes=["as-btn-row"]):
+                                        sync_btn = gr.Button(
+                                            "Auto Sync", variant="primary"
+                                        )
+                                        sync_status = gr.Textbox(
+                                            label="Sync Status",
+                                            value="",
+                                            interactive=False,
+                                        )
+                                    sync_report_file = gr.File(
+                                        label="Sync Report (json)"
+                                    )
+
+                            with gr.Row(elem_classes=["as-btn-row"]):
+                                video_preset = gr.Dropdown(
+                                    label="Video Preset",
+                                    choices=[
+                                        "hd16x9",
+                                        "uhd4k16x9",
+                                        "vertical1080",
+                                    ],
+                                    value="hd16x9",
+                                )
+                                lyric_offset = gr.Slider(
+                                    label="Lyric Offset (sec)",
+                                    minimum=-3.0,
+                                    maximum=3.0,
+                                    step=0.05,
+                                    value=0.0,
+                                )
+                                auto_lead_in = gr.Checkbox(
+                                    label="Auto Lead-in", value=True
+                                )
+                                make_video_btn = gr.Button(
+                                    "Make Lyric Video", variant="primary"
+                                )
+                                open_btn = gr.Button(
+                                    "Open Output Folder", variant="secondary"
+                                )
+                                open_result = gr.Textbox(
+                                    label="Open Result", value="", interactive=False
+                                )
+
+                            video_status = gr.Textbox(
+                                label="Video Status", value="", interactive=False
+                            )
+                            video_file = gr.File(label="Lyric Video (mp4)")
+
+                        with gr.Group(elem_classes=["as-card"]):
+                            gr.Markdown("## History")
+                            with gr.Row(elem_classes=["as-btn-row"]):
+                                hist_refresh_btn = gr.Button(
+                                    "Refresh History", variant="secondary"
+                                )
+                                history = gr.Dropdown(
+                                    label="Recent Runs", choices=[], value=None
+                                )
+                                open_run_btn = gr.Button(
+                                    "Open Selected Run Folder", variant="secondary"
+                                )
+
+                    runs_json = gr.Textbox(label="_runs_json", value="", visible=False)
+
+                    with gr.Group(elem_classes=["as-card"]):
+                        gr.Markdown("## Logs")
+                        log_box = gr.Textbox(
+                            label="Logs", value="", lines=18, interactive=False
+                        )
+
+                    with gr.Group(elem_classes=["as-card"]):
+                        gr.Markdown("## Files")
+                        with gr.Row():
+                            audio_file = gr.File(label="Audio")
+                            meta_file = gr.File(label="Meta JSON")
+
+            with gr.Tab("System & Server", id="system"):
+                with gr.Group(elem_classes=["as-card"]):
+                    gr.Markdown("## Connections")
+                    llm_base = gr.Textbox(label="LLM Base URL", value=default_llm_base)
+                    llm_model = gr.Textbox(label="LLM Model", value=default_llm_model)
+                    llm_api_key = gr.Textbox(
+                        label="LLM API Key (optional)",
+                        value=os.environ.get("LLM_API_KEY")
+                        or os.environ.get("OPENAI_API_KEY")
+                        or "",
+                        type="password",
+                        placeholder="If blank, uses .env / environment",
+                    )
+                    with gr.Row(elem_classes=["as-btn-row"]):
+                        save_key_btn = gr.Button(
+                            "Save Key to .env", variant="secondary"
+                        )
+                    save_key_result = gr.Textbox(
+                        label="Key Save Result", value="", interactive=False
+                    )
+                    acestep_api = gr.Textbox(
+                        label="ACE-Step API Base", value=default_acestep_api
+                    )
+
+                with gr.Group(elem_classes=["as-card"]):
+                    gr.Markdown("## Paths")
+                    acestep_dir_in = gr.Textbox(
+                        label="ACE-Step Folder",
+                        value=default_acestep_dir,
+                        placeholder="Example: ACE-Step-1.5 or D:\\path\\to\\ACE-Step-1.5",
+                    )
+                    comfy_bat_in = gr.Textbox(
+                        label="ComfyUI Start .bat (optional)",
+                        value=default_comfy_bat,
+                        placeholder="Example: D:\\ComfyUI\\run_nvidia_gpu.bat",
+                    )
+                    comfy_args = gr.Textbox(
+                        label="ComfyUI Args (advanced)",
+                        value=default_comfy_args,
+                        placeholder="Example: --cache-none --disable-all-custom-nodes --normalvram",
+                    )
 
                 with gr.Row():
-                    suggest_topic_btn = gr.Button(
-                        "Suggest Topic From Style", variant="secondary"
-                    )
-                    suggest_style_btn = gr.Button(
-                        "Suggest Style From Topic", variant="secondary"
-                    )
-                    suggest_both_btn = gr.Button("Suggest Both", variant="secondary")
-                suggest_status = gr.Textbox(
-                    label="Idea Tool Status", value="", interactive=False
-                )
+                    with gr.Column(scale=1, min_width=420):
+                        with gr.Group(elem_classes=["as-card"]):
+                            gr.Markdown("## ACE-Step Server")
+                            with gr.Row(elem_classes=["as-btn-row"]):
+                                srv_start_btn = gr.Button(
+                                    "Start ACE-Step Server", variant="primary"
+                                )
+                                srv_stop_btn = gr.Button(
+                                    "Stop ACE-Step Server", variant="stop"
+                                )
+                                live_logs = gr.Checkbox(label="Live Logs", value=True)
+                            srv_status = gr.Textbox(
+                                label="ACE-Step Control", value="", interactive=False
+                            )
+                            srv_log = gr.Textbox(
+                                label="ACE-Step Server Log (managed)",
+                                value="",
+                                lines=10,
+                                interactive=False,
+                            )
 
-                lang = gr.Textbox(label="Language", value="en")
-
-                with gr.Row():
-                    duration = gr.Slider(
-                        label="Duration (sec)",
-                        minimum=10,
-                        maximum=210,
-                        step=1,
-                        value=30,
-                    )
-                    audio_format = gr.Dropdown(
-                        label="Audio Format",
-                        choices=["mp3", "wav", "flac"],
-                        value="mp3",
-                    )
-
-                with gr.Row():
-                    batch_size = gr.Slider(
-                        label="Batch Size", minimum=1, maximum=8, step=1, value=1
-                    )
-                    inference_steps = gr.Slider(
-                        label="Inference Steps", minimum=1, maximum=50, step=1, value=8
-                    )
-
-                with gr.Row():
-                    thinking = gr.Checkbox(label="Thinking", value=True)
-                    skip_format = gr.Checkbox(label="Skip /format_input", value=False)
-
-                batch_count = gr.Slider(
-                    label="Batch Count (sequential)",
-                    minimum=1,
-                    maximum=20,
-                    step=1,
-                    value=1,
-                )
-
-                with gr.Row():
-                    reroll_mode = gr.Dropdown(
-                        label="Batch Re-suggest",
-                        choices=[
-                            "None",
-                            "Topic from Style",
-                            "Style from Topic",
-                            "Both",
-                        ],
-                        value="None",
-                    )
-                    reroll_on_first = gr.Checkbox(
-                        label="Re-suggest on run #1", value=False
-                    )
-
-                outdir = gr.Textbox(label="Output Folder", value="output")
-
-            with gr.Column(scale=2):
-                llm_base = gr.Textbox(label="LLM Base URL", value=default_llm_base)
-                llm_model = gr.Textbox(label="LLM Model", value=default_llm_model)
-                llm_api_key = gr.Textbox(
-                    label="LLM API Key (optional)",
-                    value=os.environ.get("LLM_API_KEY")
-                    or os.environ.get("OPENAI_API_KEY")
-                    or "",
-                    type="password",
-                    placeholder="If blank, uses .env / environment",
-                )
-                save_key_btn = gr.Button("Save Key to .env", variant="secondary")
-                save_key_result = gr.Textbox(
-                    label="Key Save Result", value="", interactive=False
-                )
-                acestep_api = gr.Textbox(
-                    label="ACE-Step API Base", value=default_acestep_api
-                )
-
-        with gr.Row():
-            start_btn = gr.Button("Start", variant="primary")
-            stop_btn = gr.Button("Stop", variant="stop")
-
-        with gr.Row():
-            run_status = gr.Textbox(
-                label="Run Status", value="Idle.", interactive=False
-            )
-            open_btn = gr.Button("Open Output Folder", variant="secondary")
-            open_result = gr.Textbox(label="Open Result", value="", interactive=False)
-
-        out_dir_box = gr.Textbox(
-            label="Latest Output Directory", value="", interactive=False
-        )
-
-        effective_topic = gr.Textbox(
-            label="Effective Topic (current run)", value="", interactive=False
-        )
-        effective_style = gr.Textbox(
-            label="Effective Style (includes genres)", value="", interactive=False
-        )
-
-        with gr.Row():
-            hist_refresh_btn = gr.Button("Refresh History", variant="secondary")
-            history = gr.Dropdown(label="Recent Runs", choices=[], value=None)
-
-        runs_json = gr.Textbox(label="_runs_json", value="", visible=False)
-
-        log_box = gr.Textbox(label="Logs", value="", lines=18, interactive=False)
-
-        with gr.Row():
-            audio_file = gr.File(label="Audio")
-            meta_file = gr.File(label="Meta JSON")
+                    with gr.Column(scale=1, min_width=420):
+                        with gr.Group(elem_classes=["as-card"]):
+                            gr.Markdown("## ComfyUI Server")
+                            with gr.Row(elem_classes=["as-btn-row"]):
+                                comfy_start_btn = gr.Button(
+                                    "Start ComfyUI", variant="primary"
+                                )
+                                comfy_stop_btn = gr.Button(
+                                    "Stop ComfyUI", variant="stop"
+                                )
+                            comfy_status = gr.Textbox(
+                                label="ComfyUI Control", value="", interactive=False
+                            )
+                            comfy_log = gr.Textbox(
+                                label="ComfyUI Server Log (managed)",
+                                value="",
+                                lines=10,
+                                interactive=False,
+                            )
 
         status_btn.click(
-            fn=lambda llm_base, llm_api_key, acestep_api: _check_endpoints(
-                llm_base=llm_base, llm_api_key=llm_api_key, acestep_api=acestep_api
+            fn=lambda llm_base, llm_api_key, acestep_api, comfy_url: _check_endpoints(
+                llm_base=llm_base,
+                llm_api_key=llm_api_key,
+                acestep_api=acestep_api,
+                comfy_url=comfy_url,
             ),
-            inputs=[llm_base, llm_api_key, acestep_api],
+            inputs=[llm_base, llm_api_key, acestep_api, comfy_url],
             outputs=[status_box],
         )
 
@@ -1311,37 +2703,20 @@ def main() -> int:
         )
 
         suggest_style_btn.click(
-            fn=lambda topic, genres, llm_base, llm_model, llm_api_key: (
-                llm_suggest_style(
-                    topic=topic,
-                    genres=genres,
-                    llm_base=llm_base,
-                    llm_model=llm_model,
-                    llm_api_key=llm_api_key,
-                )
-            ),
+            fn=suggest_style_click,
             inputs=[topic, genres, llm_base, llm_model, llm_api_key],
-            outputs=[style, suggest_status],
+            outputs=[style, genres, suggest_status],
         )
 
-        suggest_both_btn.click(
-            fn=lambda topic, style, genres, llm_base, llm_model, llm_api_key: (
-                llm_suggest_both(
-                    topic=topic,
-                    style=style,
-                    genres=genres,
-                    llm_base=llm_base,
-                    llm_model=llm_model,
-                    llm_api_key=llm_api_key,
-                )
-            ),
-            inputs=[topic, style, genres, llm_base, llm_model, llm_api_key],
-            outputs=[topic, style, suggest_status],
+        random_idea_btn.click(
+            fn=random_idea_click,
+            inputs=[genres, llm_base, llm_model, llm_api_key],
+            outputs=[topic, style, genres, suggest_status],
         )
 
         srv_start_btn.click(
             fn=start_acestep_server,
-            inputs=[acestep_api, server_state],
+            inputs=[acestep_api, acestep_dir_in, server_state],
             outputs=[srv_log, srv_status, server_state],
         )
 
@@ -1351,10 +2726,91 @@ def main() -> int:
             outputs=[srv_log, srv_status, server_state],
         )
 
+        comfy_start_btn.click(
+            fn=start_comfyui_server,
+            inputs=[comfy_url, comfy_bat_in, comfy_args, comfy_state],
+            outputs=[comfy_log, comfy_status, comfy_state],
+        )
+
+        comfy_stop_btn.click(
+            fn=stop_comfyui_server,
+            inputs=[comfy_state],
+            outputs=[comfy_log, comfy_status, comfy_state],
+        )
+
+        # Generate tab shortcuts (mirror System & Server controls).
+        gen_srv_start.click(
+            fn=start_acestep_server,
+            inputs=[acestep_api, acestep_dir_in, server_state],
+            outputs=[srv_log_gen, srv_status_gen, server_state],
+        )
+        gen_srv_stop.click(
+            fn=stop_acestep_server,
+            inputs=[server_state],
+            outputs=[srv_log_gen, srv_status_gen, server_state],
+        )
+        gen_comfy_start.click(
+            fn=start_comfyui_server,
+            inputs=[comfy_url, comfy_bat_in, comfy_args, comfy_state],
+            outputs=[comfy_log_gen, comfy_status_gen, comfy_state],
+        )
+        gen_comfy_stop.click(
+            fn=stop_comfyui_server,
+            inputs=[comfy_state],
+            outputs=[comfy_log_gen, comfy_status_gen, comfy_state],
+        )
+
+        # Live log updater (managed processes only).
+        try:
+            log_timer = gr.Timer(1.0)
+            log_timer.tick(
+                fn=poll_managed_logs,
+                inputs=[
+                    live_logs,
+                    live_logs_gen,
+                    acestep_api,
+                    comfy_url,
+                    server_state,
+                    comfy_state,
+                ],
+                outputs=[srv_log, srv_status, comfy_log, comfy_status],
+            )
+
+            # Mirror the same managed logs onto the Generate tab.
+            log_timer.tick(
+                fn=poll_managed_logs,
+                inputs=[
+                    live_logs,
+                    live_logs_gen,
+                    acestep_api,
+                    comfy_url,
+                    server_state,
+                    comfy_state,
+                ],
+                outputs=[srv_log_gen, srv_status_gen, comfy_log_gen, comfy_status_gen],
+            )
+        except Exception:
+            # Older Gradio may not support Timer; logs will still update on button clicks.
+            pass
+
         hist_refresh_btn.click(
             fn=refresh_history,
             inputs=[outdir],
             outputs=[history, runs_json],
+        )
+
+        sync_btn.click(
+            fn=auto_sync_lyrics,
+            inputs=[
+                out_dir_box,
+                sync_use_gpu,
+                sync_demucs,
+                sync_model,
+                sync_words,
+                sync_max_seg,
+                sync_lead,
+            ],
+            outputs=[sync_status, sync_report_file],
         )
 
         history.change(
@@ -1417,6 +2873,72 @@ def main() -> int:
             fn=open_output_folder,
             inputs=[out_dir_box],
             outputs=[open_result],
+        )
+
+        open_run_btn.click(
+            fn=open_run_folder_from_history,
+            inputs=[out_dir_box],
+            outputs=[open_result],
+        )
+
+        make_video_btn.click(
+            fn=render_lyric_video,
+            inputs=[
+                out_dir_box,
+                outdir,
+                video_preset,
+                lyric_offset,
+                auto_lead_in,
+                bg_video_path,
+                bg_mode,
+                bg_crossfade,
+                viz_mode,
+                viz_opacity,
+                bg_blur,
+                bg_grain,
+                bg_vignette,
+                bg_brightness,
+                bg_saturation,
+                bg_contrast,
+                plate_alpha,
+            ],
+            outputs=[video_status, video_file],
+        )
+
+        bg_btn.click(
+            fn=generate_bg_loop,
+            inputs=[
+                out_dir_box,
+                comfy_url,
+                ckpt_name,
+                bg_loop_seconds,
+                bg_quality,
+                bg_use_llm,
+                llm_base,
+                llm_model,
+                llm_api_key,
+            ],
+            outputs=[bg_status, bg_file, bg_prompt_file],
+        )
+
+        bg_preset.change(
+            fn=_bg_preset_updates,
+            inputs=[bg_preset],
+            outputs=[
+                bg_blur,
+                bg_grain,
+                bg_vignette,
+                bg_brightness,
+                bg_saturation,
+                bg_contrast,
+                plate_alpha,
+            ],
+        )
+
+        apply_bg_preset_btn.click(
+            fn=apply_recommended_bg_preset,
+            inputs=[out_dir_box, bg_prompt_file],
+            outputs=[bg_preset, apply_bg_preset_status],
         )
 
         demo.load(fn=refresh_history, inputs=[outdir], outputs=[history, runs_json])

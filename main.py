@@ -95,14 +95,20 @@ def _extract_json_object(text: str) -> dict:
     except Exception:
         pass
 
-    # Fallback: extract first {...} block
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not m:
-        raise ValueError("LLM did not return JSON")
-    obj = json.loads(m.group(0))
-    if not isinstance(obj, dict):
-        raise ValueError("LLM JSON root is not an object")
-    return obj
+    # Fall back to extracting the first JSON object from mixed text.
+    # Some LLM servers occasionally prepend/append non-JSON text.
+    dec = json.JSONDecoder()
+    i = text.find("{")
+    while i != -1:
+        try:
+            obj, _end = dec.raw_decode(text[i:])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        i = text.find("{", i + 1)
+
+    raise ValueError("LLM did not return a JSON object")
 
 
 def llm_generate_song_package(
@@ -118,7 +124,7 @@ def llm_generate_song_package(
     url = llm_base_url.rstrip("/") + "/chat/completions"
     system_msg = (
         "You write song packages for music generation. "
-        "Return ONLY valid JSON, no markdown, no extra text. "
+        "Return ONLY valid JSON, no markdown, no code fences, no extra text. "
         "All text should be ASCII."
     )
     user_msg = (
@@ -250,145 +256,161 @@ def _join_url(base: str, path_or_url: str) -> str:
 
 
 def main() -> int:
-    _load_dotenv(".env")
+    try:
+        _load_dotenv(".env")
 
-    p = argparse.ArgumentParser(
-        description="Generate lyrics then trigger ACE-Step to render audio"
-    )
-    p.add_argument("--topic", required=True)
-    p.add_argument("--style", required=True)
-    p.add_argument("--lang", default="en")
-    p.add_argument("--duration", type=float, default=45)
-    p.add_argument("--audio-format", default="mp3", choices=["mp3", "wav", "flac"])
-    p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--inference-steps", type=int, default=8)
-    p.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True)
+        p = argparse.ArgumentParser(
+            description="Generate lyrics then trigger ACE-Step to render audio"
+        )
+        p.add_argument("--topic", required=True)
+        p.add_argument("--style", required=True)
+        p.add_argument("--lang", default="en")
+        p.add_argument("--duration", type=float, default=45)
+        p.add_argument("--audio-format", default="mp3", choices=["mp3", "wav", "flac"])
+        p.add_argument("--batch-size", type=int, default=1)
+        p.add_argument("--inference-steps", type=int, default=8)
+        p.add_argument(
+            "--thinking", action=argparse.BooleanOptionalAction, default=True
+        )
 
-    p.add_argument("--outdir", default="output")
-    p.add_argument(
-        "--llm-base", default=os.environ.get("LLM_BASE_URL", "http://localhost:8317/v1")
-    )
-    p.add_argument("--llm-model", default=os.environ.get("LLM_MODEL", "gpt-5.2"))
-    p.add_argument(
-        "--llm-api-key",
-        default=os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"),
-        help="Optional. Sent as Authorization: Bearer <key> to the LLM server.",
-    )
-    p.add_argument(
-        "--acestep-api",
-        default=os.environ.get("ACESTEP_API_BASE", "http://127.0.0.1:8001"),
-    )
-    p.add_argument(
-        "--skip-format", action="store_true", help="Skip ACE-Step /format_input"
-    )
+        p.add_argument("--outdir", default="output")
+        p.add_argument(
+            "--llm-base",
+            default=os.environ.get("LLM_BASE_URL", "http://localhost:8317/v1"),
+        )
+        p.add_argument("--llm-model", default=os.environ.get("LLM_MODEL", "gpt-5.2"))
+        p.add_argument(
+            "--llm-api-key",
+            default=os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+            help="Optional. Sent as Authorization: Bearer <key> to the LLM server.",
+        )
+        p.add_argument(
+            "--acestep-api",
+            default=os.environ.get("ACESTEP_API_BASE", "http://127.0.0.1:8001"),
+        )
+        p.add_argument(
+            "--skip-format", action="store_true", help="Skip ACE-Step /format_input"
+        )
 
-    args = p.parse_args()
+        args = p.parse_args()
 
-    if args.duration and args.duration > 210:
-        print("Error: --duration must be <= 210 seconds")
-        print(f"- Got: {args.duration}")
-        return 2
+        if args.duration and args.duration > 210:
+            print("Error: --duration must be <= 210 seconds")
+            print(f"- Got: {args.duration}")
+            return 2
 
-    api_base = args.acestep_api
-    if not acestep_health(api_base):
-        print("ACE-Step API is not reachable.")
-        print(f"- Expected: {api_base}")
-        print("- Start it with: ACE-Step-1.5\\start_api_server.bat")
-        return 2
+        api_base = args.acestep_api
+        if not acestep_health(api_base):
+            print("Error: ACE-Step API is not reachable.")
+            print(f"- Expected: {api_base}")
+            print("- Start it with: ACE-Step-1.5\\start_api_server.bat")
+            return 2
 
-    os.makedirs(args.outdir, exist_ok=True)
+        os.makedirs(args.outdir, exist_ok=True)
 
-    song = llm_generate_song_package(
-        llm_base_url=args.llm_base,
-        llm_model=args.llm_model,
-        llm_api_key=args.llm_api_key,
-        topic=args.topic,
-        style=args.style,
-        lang=args.lang,
-        duration=args.duration,
-    )
-    title = song["title"]
-    caption = song["caption"]
-    lyrics = song["lyrics"]
+        song = llm_generate_song_package(
+            llm_base_url=args.llm_base,
+            llm_model=args.llm_model,
+            llm_api_key=args.llm_api_key,
+            topic=args.topic,
+            style=args.style,
+            lang=args.lang,
+            duration=args.duration,
+        )
+        title = song["title"]
+        caption = song["caption"]
+        lyrics = song["lyrics"]
 
-    format_data = {}
-    if not args.skip_format:
-        try:
-            format_data = acestep_format_input(
-                api_base=api_base,
-                caption=caption,
-                lyrics=lyrics,
-                lang=args.lang,
-                duration=args.duration,
-            )
-            caption = (format_data.get("caption") or caption).strip()
-            lyrics = (format_data.get("lyrics") or lyrics).strip()
-        except Exception as e:
-            print(f"Warning: /format_input failed, continuing without it: {e}")
+        format_data = {}
+        if not args.skip_format:
+            try:
+                format_data = acestep_format_input(
+                    api_base=api_base,
+                    caption=caption,
+                    lyrics=lyrics,
+                    lang=args.lang,
+                    duration=args.duration,
+                )
+                caption = (format_data.get("caption") or caption).strip()
+                lyrics = (format_data.get("lyrics") or lyrics).strip()
+            except Exception as e:
+                print(f"Warning: /format_input failed, continuing without it: {e}")
 
-    task_id = acestep_release_task(
-        api_base=api_base,
-        caption=caption,
-        lyrics=lyrics,
-        lang=args.lang,
-        duration=args.duration,
-        audio_format=args.audio_format,
-        inference_steps=args.inference_steps,
-        batch_size=args.batch_size,
-        thinking=args.thinking,
-    )
-    print(f"Submitted task: {task_id}")
+        task_id = acestep_release_task(
+            api_base=api_base,
+            caption=caption,
+            lyrics=lyrics,
+            lang=args.lang,
+            duration=args.duration,
+            audio_format=args.audio_format,
+            inference_steps=args.inference_steps,
+            batch_size=args.batch_size,
+            thinking=args.thinking,
+        )
+        print(f"Submitted task: {task_id}")
 
-    result = acestep_wait_result(api_base=api_base, task_id=task_id, poll_sec=1.0)
-    out0 = result["result_list"][0]
-    file_url = out0.get("file")
-    if not file_url:
-        raise RuntimeError(f"ACE-Step result missing file url: {out0}")
-    download_url = _join_url(api_base, file_url)
+        result = acestep_wait_result(api_base=api_base, task_id=task_id, poll_sec=1.0)
+        out0 = result["result_list"][0]
+        file_url = out0.get("file")
+        if not file_url:
+            raise RuntimeError(f"ACE-Step result missing file url: {out0}")
+        download_url = _join_url(api_base, file_url)
 
-    stamp = _now_stamp()
-    safe_title = _slugify(title)
-    song_dir = os.path.join(args.outdir, f"{stamp}_{safe_title}")
-    os.makedirs(song_dir, exist_ok=True)
-    audio_path = os.path.join(song_dir, f"audio.{args.audio_format}")
-    meta_path = os.path.join(song_dir, "meta.json")
+        stamp = _now_stamp()
+        safe_title = _slugify(title)
+        song_dir = os.path.join(args.outdir, f"{stamp}_{safe_title}")
+        os.makedirs(song_dir, exist_ok=True)
+        audio_path = os.path.join(song_dir, f"audio.{args.audio_format}")
+        meta_path = os.path.join(song_dir, "meta.json")
 
-    audio_bytes = _http_get_bytes(download_url, timeout=600)
-    with open(audio_path, "wb") as f:
-        f.write(audio_bytes)
+        audio_bytes = _http_get_bytes(download_url, timeout=600)
+        with open(audio_path, "wb") as f:
+            f.write(audio_bytes)
 
-    sidecar = {
-        "title": title,
-        "topic": args.topic,
-        "style": args.style,
-        "lang": args.lang,
-        "duration": args.duration,
-        "caption": caption,
-        "lyrics": lyrics,
-        "llm": {"base_url": args.llm_base, "model": args.llm_model},
-        "acestep": {
-            "api_base": api_base,
-            "task_id": task_id,
-            "request": {
-                "audio_format": args.audio_format,
-                "inference_steps": args.inference_steps,
-                "batch_size": args.batch_size,
-                "thinking": args.thinking,
+        sidecar = {
+            "title": title,
+            "topic": args.topic,
+            "style": args.style,
+            "lang": args.lang,
+            "duration": args.duration,
+            "caption": caption,
+            "lyrics": lyrics,
+            "llm": {"base_url": args.llm_base, "model": args.llm_model},
+            "acestep": {
+                "api_base": api_base,
+                "task_id": task_id,
+                "request": {
+                    "audio_format": args.audio_format,
+                    "inference_steps": args.inference_steps,
+                    "batch_size": args.batch_size,
+                    "thinking": args.thinking,
+                },
+                "format_input": format_data,
+                "query_item": result["query_item"],
+                "result": out0,
+                "download_url": download_url,
             },
-            "format_input": format_data,
-            "query_item": result["query_item"],
-            "result": out0,
-            "download_url": download_url,
-        },
-        "output": {"audio": audio_path, "meta": meta_path},
-        "created_at": stamp,
-    }
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(sidecar, f, ensure_ascii=True, indent=2)
+            "output": {"audio": audio_path, "meta": meta_path},
+            "created_at": stamp,
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(sidecar, f, ensure_ascii=True, indent=2)
 
-    print(f"Saved audio: {audio_path}")
-    print(f"Saved meta : {meta_path}")
-    return 0
+        print(f"Saved audio: {audio_path}")
+        print(f"Saved meta : {meta_path}")
+        return 0
+    except Exception as e:
+        # Avoid noisy tracebacks in the WebUI logs by default.
+        debug = str(os.environ.get("ACESTEPAUTO_DEBUG", "")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if debug:
+            raise
+        print(f"Error: {e}")
+        return 2
 
 
 if __name__ == "__main__":
