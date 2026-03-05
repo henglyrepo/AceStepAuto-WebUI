@@ -2284,6 +2284,15 @@ def main() -> int:
                                 value="",
                                 interactive=False,
                             )
+                            with gr.Row(elem_classes=["as-btn-row"]):
+                                open_latest_btn = gr.Button(
+                                    "Open Latest Output Folder", variant="secondary"
+                                )
+                                open_latest_result = gr.Textbox(
+                                    label="Open Result",
+                                    value="",
+                                    interactive=False,
+                                )
 
                             with gr.Group(elem_classes=["as-card"]):
                                 gr.Markdown("## Video Builder")
@@ -2797,6 +2806,12 @@ def main() -> int:
             fn=refresh_history,
             inputs=[outdir],
             outputs=[history, runs_json],
+        )
+
+        open_latest_btn.click(
+            fn=open_run_folder_from_history,
+            inputs=[out_dir_box],
+            outputs=[open_latest_result],
         )
 
         sync_btn.click(
